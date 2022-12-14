@@ -1,7 +1,12 @@
+from collections import OrderedDict
+from typing import Optional, Callable, Tuple, List
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
+
+from template.model.model import AbstractModel
 
 
 # convolution layers
@@ -55,7 +60,7 @@ class ConvBlock(nn.Module):
         return self.fc(x)
 
 
-class SAFE(pl.LightningModule):
+class SAFE(AbstractModel):
     def __init__(
         self,
         head_size: int = 30,
@@ -65,17 +70,21 @@ class SAFE(pl.LightningModule):
         input_len: int = 32,
         num_filters: int = 128,
         final_len: int = 200,
-        learning_rate: float = 1e-3,
-        max_epochs: int = 30,
         dropout_prob: float = 0.,
+        loss_funcs: Optional[List[Callable]] = None,
+        loss_weights: Optional[List[float]] = None,
     ):
-        super().__init__()
-        self.save_hyperparameters()
+        super(SAFE, self).__init__()
+
+        if loss_funcs is None:
+            loss_funcs = [nn.CrossEntropyLoss(), nn.CrossEntropyLoss()]
+        self.loss_funcs = loss_funcs
+        if loss_weights is None:
+            loss_weights = [1.0, 1.0]
+        self.loss_weights = loss_weights
 
         self.embedding_size = embedding_size
         self.input_len = input_len
-        self.learning_rate = learning_rate
-        self.max_epochs = max_epochs
         self.dropout_prob = dropout_prob
 
         self.reduce = nn.Linear(embedding_size, input_len)
@@ -115,14 +124,12 @@ class SAFE(pl.LightningModule):
         x_heads: torch.Tensor,
         x_bodies: torch.Tensor,
         x_images: torch.Tensor,
-        targets: torch.Tensor,
     ):
-        # 全连接层降维
+
         x_heads = self.reduce(x_heads)
         x_bodies = self.reduce(x_bodies)
         x_images = self.reduce(x_images)
 
-        # 卷积层
         headline_vectors = self.head_block(x_heads)
         body_vectors = self.body_block(x_bodies)
         image_vectors = self.image_block(x_images)
@@ -142,59 +149,26 @@ class SAFE(pl.LightningModule):
         distance = 1 - cosine_similarity
         cos_preds = torch.stack([distance, cosine_similarity], 1)
 
-        # 全连接层预测
         vecs = torch.cat([headline_vectors, body_vectors, image_vectors], dim=1)
         logits = self.predictor(vecs)
 
-        # loss
-        loss1 = F.cross_entropy(logits, targets)
-        loss2 = -(targets * cos_preds.log()).sum(1).mean()
+        return logits, cos_preds
 
-        loss = loss1 * 0.6 + loss2 * 0.4
+    def calculate_loss(self, data) -> Tuple[torch.Tensor, str]:
+        logits, cos_preds, targets = data
 
-        preds = logits.argmax(1)
-        labels = targets.argmax(1)
-        acc = (preds == labels).sum().item() / logits.shape[0] * 100
+        loss1 = self.loss_funcs[0](logits, targets)  * self.loss_weights[0]
+        loss2 = -(targets * cos_preds.log()).sum(1).mean()  & self.loss_weights[1]
 
-        return loss, acc
+        loss = loss1 + loss2
 
-    def training_step(self, batch, batch_idx: int):
-        x_heads, x_bodies, x_images, targets = batch
+        msg = f"loss1={loss1}, loss2={loss2}"
 
-        loss, acc = self.forward(x_heads, x_bodies, x_images, targets)
+        return loss, msg
 
-        self.log("train/loss", loss, on_step=True, on_epoch=True)
-        self.log(
-            "train/acc", acc,
-            on_step=True, on_epoch=True, prog_bar=True,
-        )
+    def predict(self, data_without_label) -> torch.Tensor:
+        x_heads, x_bodies, x_images = data_without_label
 
-        return loss
+        logits, _ = self.forward(x_heads, x_bodies, x_images)
 
-    def validation_step(self, batch, batch_idx: int):
-        x_heads, x_bodies, x_images, targets = batch
-
-        loss, acc = self.forward(x_heads, x_bodies, x_images, targets)
-
-        self.log("val/loss", loss, on_step=True, on_epoch=True)
-        self.log(
-            "val/acc", acc,
-            on_step=True, on_epoch=True, prog_bar=True,
-        )
-
-    def test_step(self, batch, batch_idx: int):
-        ...
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, self.parameters()),
-            lr=self.learning_rate,
-        )
-        # lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        #     optimizer, T_max=self.max_epochs
-        # )
-
-        return {
-            "optimizer": optimizer,
-            # "lr_scheduler": lr_scheduler,
-        }
+        return logits
